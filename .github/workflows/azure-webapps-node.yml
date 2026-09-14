@@ -1,78 +1,82 @@
-# This workflow will build and push a node.js application to an Azure Web App when a commit is pushed to your default branch.
-#
-# This workflow assumes you have already created the target Azure App Service web app.
-# For instructions see https://docs.microsoft.com/en-us/azure/app-service/quickstart-nodejs?tabs=linux&pivots=development-environment-cli
-#
-# To configure this workflow:
-#
-# 1. Download the Publish Profile for your Azure Web App. You can download this file from the Overview page of your Web App in the Azure Portal.
-#    For more information: https://docs.microsoft.com/en-us/azure/app-service/deploy-github-actions?tabs=applevel#generate-deployment-credentials
-#
-# 2. Create a secret in your repository named AZURE_WEBAPP_PUBLISH_PROFILE, paste the publish profile contents as the value of the secret.
-#    For instructions on obtaining the publish profile see: https://docs.microsoft.com/azure/app-service/deploy-github-actions#configure-the-github-secret
-#
-# 3. Change the value for the AZURE_WEBAPP_NAME. Optionally, change the AZURE_WEBAPP_PACKAGE_PATH and NODE_VERSION environment variables below.
-#
-# For more information on GitHub Actions for Azure: https://github.com/Azure/Actions
-# For more information on the Azure Web Apps Deploy action: https://github.com/Azure/webapps-deploy
-# For more samples to get started with GitHub Action workflows to deploy to Azure: https://github.com/Azure/actions-workflow-samples
+name: Auto Update Worker
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
+  schedule:
+    - cron: "0 1 * * *" # 每天凌晨1点运行
   workflow_dispatch:
-
-env:
-  AZURE_WEBAPP_NAME: your-app-name    # set this to your application's name
-  AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
-  NODE_VERSION: '20.x'                # set this to the node version to use
+    inputs:
+      force_update:
+        description: '是否强制更新（忽略版本检查）'
+        required: false
+        default: 'false'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  build:
+  update:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - name: 检出仓库
+        uses: actions/checkout@v4
 
-    - name: Set up Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ env.NODE_VERSION }}
-        cache: 'npm'
+      - name: 设置环境
+        run: |
+          echo "REPO_URL=https://api.github.com/repos/bia-pain-bache/BPB-Worker-Panel/releases" >> $GITHUB_ENV
+          echo "TARGET_FILE=worker.zip" >> $GITHUB_ENV
 
-    - name: npm install, build, and test
-      run: |
-        npm install
-        npm run build --if-present
-        npm run test --if-present
+      - name: 检查并更新 Worker
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # 使用 GitHub Token 认证
+        run: |
+          # 日志函数
+          log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"; }
 
-    - name: Upload artifact for deployment job
-      uses: actions/upload-artifact@v4
-      with:
-        name: node-app
-        path: .
+          log "开始检查更新..."
 
-  deploy:
-    permissions:
-      contents: none
-    runs-on: ubuntu-latest
-    needs: build
-    environment:
-      name: 'Development'
-      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+          # 获取本地版本
+          LOCAL_VERSION=$(cat version.txt 2>/dev/null || echo "")
+          log "本地版本: ${LOCAL_VERSION:-无}"
 
-    steps:
-    - name: Download artifact from build job
-      uses: actions/download-artifact@v4
-      with:
-        name: node-app
+          # 获取最新 Release
+          log "获取最新 Release 信息..."
+          RESPONSE=$(curl -s --retry 3 -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github.v3+json" "$REPO_URL")
+          if [ $? -ne 0 ]; then
+            log "ERROR: 无法访问 GitHub API"
+            exit 1
+          fi
 
-    - name: 'Deploy to Azure WebApp'
-      id: deploy-to-webapp
-      uses: azure/webapps-deploy@v2
-      with:
-        app-name: ${{ env.AZURE_WEBAPP_NAME }}
-        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-        package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
+          TAG_NAME=$(echo "$RESPONSE" | jq -r '.[0].tag_name')
+          DOWNLOAD_URL=$(echo "$RESPONSE" | jq -r '.[0].assets[] | select(.name == "'"$TARGET_FILE"'") | .browser_download_url')
+
+          if [ -z "$DOWNLOAD_URL" ] || [ "$DOWNLOAD_URL" == "null" ]; then
+            log "ERROR: 未找到 $TARGET_FILE"
+            exit 1
+          fi
+          log "最新版本: $TAG_NAME"
+
+          # 判断是否需要更新
+          FORCE_UPDATE=${{ github.event.inputs.force_update || 'false' }}
+          if [ "$LOCAL_VERSION" = "$TAG_NAME" ] && [ "$FORCE_UPDATE" != "true" ]; then
+            log "已是最新版本，无需更新"
+            exit 0
+          fi
+
+          # 下载并更新
+          log "下载 $TARGET_FILE..."
+          wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+          log "解压 $TARGET_FILE..."
+          unzip -o "$TARGET_FILE"
+          rm "$TARGET_FILE"
+          echo "$TAG_NAME" > version.txt
+          log "更新完成，新版本: $TAG_NAME"
+
+      - name: 提交更改
+        if: success() # 仅在更新成功时提交
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "🔄 自动同步 Worker 版本: ${{ steps.check_update.outputs.tag_name || '未知' }}"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
